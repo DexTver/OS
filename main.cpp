@@ -271,44 +271,41 @@ int main() {
         wcout << L"8. Анализ и изменение атрибутов файла" << endl;
         wcout << L"9. Выход" << endl;
         wcout << L"Выберите пункт меню: ";
-        wcin >> choice;
+        if (!(wcin >> choice)) {
+            wcin.clear(); // Сброс флага ошибки
+            wcin.ignore(numeric_limits<streamsize>::max(), L'\n'); // Очистка буфера ввода
+            ClearScreen();
+            wcout << L"Ошибка ввода. Попробуйте еще раз." << endl;
+            continue;
+        }
 
         switch (choice) {
             case 1:
                 ListDrives();
-                getchar();
                 break;
             case 2:
                 ShowDriveInfo();
-                getchar();
                 break;
             case 3:
                 CreateDirectoryFunc();
-                getchar();
                 break;
             case 4:
                 RemoveDirectoryFunc();
-                getchar();
                 break;
             case 5:
                 CreateFileFunc();
-                getchar();
                 break;
             case 6:
                 CopyFileFunc();
-                getchar();
                 break;
             case 7:
                 MoveFileFunc();
-                getchar();
                 break;
             case 8:
                 FileAttributesFunc();
-                getchar();
                 break;
             case 9:
                 wcout << L"Выход из программы." << endl;
-                ClearScreen();
                 return 0;
             default:
                 ClearScreen();
