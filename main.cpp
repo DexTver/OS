@@ -1,319 +1,269 @@
-#define UNICODE
-#define _UNICODE
+#define _GNU_SOURCE
 
-#include <windows.h>
-#include <iostream>
-#include <string>
-#include <locale>
-#include <io.h>
-#include <fcntl.h>
-#include <conio.h>
+#include <cstdio>       // printf, perror
+#include <cstdlib>      // exit, EXIT_FAILURE
+#include <cstring>      // memset, strerror
+#include <aio.h>        // aio_read, aio_write, etc.
+#include <fcntl.h>      // open, O_RDONLY | O_NONBLOCK, etc.
+#include <unistd.h>     // close
+#include <signal.h>     // sigevent, SIGEV_THREAD
+#include <sys/stat.h>   // fstat
+#include <sys/types.h>  // off_t
+#include <pthread.h>    // pthread_mutex_t, pthread_mutex_lock, etc.
+#include <chrono>       // для замера времени
+#include <inttypes.h>   // PRId64
 
-using namespace std;
+// ---------------------------------------------------------------
+// Структура, описывающая одну асинхронную операцию чтения/записи
+// ---------------------------------------------------------------
+struct aio_operation {
+    struct aiocb aio;       // Управляющая структура для aio
+    char *buffer;           // Буфер для данных
+    size_t buffer_size;     // Размер буфера (байтов)
+    int write_operation;    // Флаг: 0=чтение, 1=запись
+    int slot_index;         // Индекс данного слота (для отладки)
+};
 
-// Функция для настройки консоли на использование UTF-8
-void SetConsoleToUTF8() {
-    SetConsoleCP(CP_UTF8);
-    SetConsoleOutputCP(CP_UTF8);
-    _setmode(_fileno(stdout), _O_U8TEXT);
-    _setmode(_fileno(stdin), _O_U8TEXT);
-}
+// ---------------------------------------------------------------
+// Глобальные переменные и мьютекс
+// ---------------------------------------------------------------
+static int g_fd_in = -1;            // Дескриптор исходного файла
+static int g_fd_out = -1;           // Дескриптор выходного файла
+static off_t g_file_size = 0;       // Общий размер исходного файла
+static off_t g_bytes_read = 0;      // Сколько байт запланировано к чтению
+static off_t g_bytes_written = 0;   // Сколько байт записано
+static size_t g_block_size = 0;     // Размер блока копирования
+static int g_concurrency = 1;       // Число слотов (одновременных операций)
+static bool g_copy_done = false;    // Признак завершения копирования
 
-// Функция ожидания нажатия клавиши
-void WaitForKeyPress() {
-    wcout << L"\nНажмите любую клавишу для возврата в меню...";
-    _getch();
-}
+static aio_operation *g_slots = nullptr;
+static pthread_mutex_t g_mutex = PTHREAD_MUTEX_INITIALIZER;
 
-// Функция очистки экрана
-void ClearScreen() {
-    system("cls");
-}
+// ---------------------------------------------------------------
+// ПРОТОТИПЫ вспомогательных функций
+// ---------------------------------------------------------------
+static bool schedule_read(aio_operation &op);
 
-// Вывод списка логических дисков с использованием GetLogicalDriveStrings
-void ListDrives() {
-    DWORD bufferLength = GetLogicalDriveStrings(0, nullptr);
-    if (bufferLength == 0) {
-        wcerr << L"Ошибка получения списка дисков." << endl;
-        return;
+static bool schedule_write(aio_operation &op, ssize_t bytes_to_write, off_t offset);
+
+// ---------------------------------------------------------------
+// ГЛАВНАЯ функция-обработчик AIO, вызываемая по SIGEV_THREAD
+// ---------------------------------------------------------------
+static void aio_completion_handler(sigval_t sigval) {
+    aio_operation *op = (aio_operation *) sigval.sival_ptr;
+    if (!op) return;
+
+    if (op->write_operation == 0) {
+        // Завершилась операция чтения
+        ssize_t rbytes = aio_return(&op->aio);
+        if (rbytes < 0) {
+            perror("aio_return (read)");
+            delete[] op->buffer;
+            op->buffer = nullptr;
+            return;
+        }
+
+        // Если rbytes == 0 -> EOF, освобождаем буфер
+        if (rbytes == 0) {
+            delete[] op->buffer;
+            op->buffer = nullptr;
+            return;
+        }
+
+        // Успешно прочитано rbytes байт. Запланируем запись
+        off_t write_offset = op->aio.aio_offset;
+        if (!schedule_write(*op, rbytes, write_offset)) {
+            perror("schedule_write");
+            // Запись не стартовала, освободим буфер
+            delete[] op->buffer;
+            op->buffer = nullptr;
+        }
+
+    } else {
+        // Завершилась операция записи
+        ssize_t wbytes = aio_return(&op->aio);
+        if (wbytes < 0) {
+            perror("aio_return (write)");
+        } else {
+            // Обновим счётчик записанных байт
+            pthread_mutex_lock(&g_mutex);
+            g_bytes_written += wbytes;
+            if (g_bytes_written >= g_file_size) {
+                g_copy_done = true;
+            }
+            pthread_mutex_unlock(&g_mutex);
+        }
+
+        // Освободим буфер
+        delete[] op->buffer;
+        op->buffer = nullptr;
+
+        // Попробуем запланировать новое чтение, если копирование не завершено
+        pthread_mutex_lock(&g_mutex);
+        bool done = g_copy_done;
+        pthread_mutex_unlock(&g_mutex);
+
+        if (!done) {
+            (void) schedule_read(*op);
+        }
     }
-    auto *buffer = new wchar_t[bufferLength];
-    DWORD result = GetLogicalDriveStrings(bufferLength, buffer);
-    if (result == 0) {
-        wcerr << L"Ошибка получения списка дисков." << endl;
-        delete[] buffer;
-        return;
-    }
-    wcout << L"Список логических дисков:" << endl;
-    wchar_t *current = buffer;
-    while (*current) {
-        wcout << current << endl;
-        current += wcslen(current) + 1;
-    }
-    delete[] buffer;
 }
 
-// Вывод информации о выбранном диске и размере свободного места
-void ShowDriveInfo() {
-    wstring drive;
-    wcout << L"Введите букву диска (например, C): ";
-    wcin >> drive;
-    if (drive.length() == 1)
-        drive = drive + L":\\";
-    else if (drive.length() == 2 && drive[1] == L':')
-        drive += L"\\";
+// ---------------------------------------------------------------
+// Планирование асинхронного чтения
+// ---------------------------------------------------------------
+static bool schedule_read(aio_operation &op) {
+    pthread_mutex_lock(&g_mutex);
 
-    UINT driveType = GetDriveType(drive.c_str());
-    wcout << L"Тип диска: ";
-    switch (driveType) {
-        case DRIVE_UNKNOWN: wcout << L"Неизвестно";
+    if (g_bytes_read >= g_file_size) {
+        pthread_mutex_unlock(&g_mutex);
+        return false;
+    }
+
+    off_t remaining = g_file_size - g_bytes_read;
+    size_t to_read = (remaining < (off_t) g_block_size) ? (size_t) remaining : g_block_size;
+
+    off_t offset = g_bytes_read;
+    g_bytes_read += to_read;
+
+    pthread_mutex_unlock(&g_mutex);
+
+    // Настройка структуры
+    memset(&op.aio, 0, sizeof(op.aio));
+    op.write_operation = 0;
+    op.buffer_size = to_read;
+    op.buffer = new char[to_read];
+
+    op.aio.aio_fildes = g_fd_in;
+    op.aio.aio_buf = op.buffer;
+    op.aio.aio_nbytes = to_read;
+    op.aio.aio_offset = offset;
+
+    // Указываем обработчик завершения
+    op.aio.aio_sigevent.sigev_notify = SIGEV_THREAD;
+    op.aio.aio_sigevent.sigev_notify_function = aio_completion_handler;
+    op.aio.aio_sigevent.sigev_notify_attributes = nullptr;
+    op.aio.aio_sigevent.sigev_value.sival_ptr = (void *) &op;
+
+    // Запускаем чтение
+    if (aio_read(&op.aio) < 0) {
+        perror("aio_read");
+        delete[] op.buffer;
+        op.buffer = nullptr;
+        return false;
+    }
+
+    return true;
+}
+
+// ---------------------------------------------------------------
+// Планирование асинхронной записи
+// ---------------------------------------------------------------
+static bool schedule_write(aio_operation &op, ssize_t bytes_to_write, off_t offset) {
+    op.write_operation = 1;
+    memset(&op.aio, 0, sizeof(op.aio));
+    op.aio.aio_fildes = g_fd_out;
+    op.aio.aio_buf = op.buffer;
+    op.aio.aio_nbytes = bytes_to_write;
+    op.aio.aio_offset = offset;
+
+    op.aio.aio_sigevent.sigev_notify = SIGEV_THREAD;
+    op.aio.aio_sigevent.sigev_notify_function = aio_completion_handler;
+    op.aio.aio_sigevent.sigev_notify_attributes = nullptr;
+    op.aio.aio_sigevent.sigev_value.sival_ptr = (void *) &op;
+
+    if (aio_write(&op.aio) < 0) {
+        perror("aio_write");
+        return false;
+    }
+    return true;
+}
+
+// ---------------------------------------------------------------
+// main
+// ---------------------------------------------------------------
+int main(int argc, char *argv[]) {
+    if (argc < 5) {
+        printf("Usage: %s <source_file> <dest_file> <block_size> <concurrency>\n", argv[0]);
+        return 0;
+    }
+
+    const char *source_path = argv[1];
+    const char *dest_path = argv[2];
+    g_block_size = (size_t) atoll(argv[3]);
+    g_concurrency = atoi(argv[4]);
+
+    // Открываем файлы
+    g_fd_in = open(source_path, O_RDONLY | O_NONBLOCK);
+    if (g_fd_in < 0) {
+        perror("open source");
+        exit(EXIT_FAILURE);
+    }
+
+    g_fd_out = open(dest_path, O_CREAT | O_WRONLY | O_TRUNC | O_NONBLOCK, 0666);
+    if (g_fd_out < 0) {
+        perror("open dest");
+        close(g_fd_in);
+        exit(EXIT_FAILURE);
+    }
+
+    // Узнаём размер исходного файла
+    struct stat st;
+    if (fstat(g_fd_in, &st) < 0) {
+        perror("fstat");
+        close(g_fd_in);
+        close(g_fd_out);
+        exit(EXIT_FAILURE);
+    }
+    g_file_size = st.st_size;
+
+    printf("Copying from '%s' to '%s'\n", source_path, dest_path);
+    printf("File size = %" PRId64 " bytes\n", (int64_t) g_file_size);
+    printf("Block size = %zu, concurrency = %d\n", g_block_size, g_concurrency);
+
+    auto start_time = std::chrono::high_resolution_clock::now();
+
+    // Создаём массив слотов
+    g_slots = new aio_operation[g_concurrency];
+    for (int i = 0; i < g_concurrency; i++) {
+        memset(&g_slots[i], 0, sizeof(aio_operation));
+        g_slots[i].slot_index = i;
+    }
+
+    // Запускаем до g_concurrency операций чтения
+    for (int i = 0; i < g_concurrency; i++) {
+        if (!schedule_read(g_slots[i])) {
+            // Возможно, файл слишком мал - дальше не читаем
             break;
-        case DRIVE_NO_ROOT_DIR: wcout << L"Отсутствует корневой каталог";
-            break;
-        case DRIVE_REMOVABLE: wcout << L"Съемный диск";
-            break;
-        case DRIVE_FIXED: wcout << L"Фиксированный диск";
-            break;
-        case DRIVE_REMOTE: wcout << L"Сетевой диск";
-            break;
-        case DRIVE_CDROM: wcout << L"CD/DVD диск";
-            break;
-        case DRIVE_RAMDISK: wcout << L"RAM диск";
-            break;
-        default: wcout << L"Неизвестно";
-            break;
-    }
-    wcout << endl;
-
-    wchar_t volumeNameBuffer[MAX_PATH + 1] = {0};
-    wchar_t fileSystemNameBuffer[MAX_PATH + 1] = {0};
-    DWORD serialNumber = 0, maxComponentLen = 0, fileSystemFlags = 0;
-    if (GetVolumeInformation(drive.c_str(), volumeNameBuffer, MAX_PATH,
-                             &serialNumber, &maxComponentLen, &fileSystemFlags,
-                             fileSystemNameBuffer, MAX_PATH)) {
-        wcout << L"Метка тома: " << volumeNameBuffer << endl;
-        wcout << L"Файловая система: " << fileSystemNameBuffer << endl;
-        wcout << L"Серийный номер: " << serialNumber << endl;
-    } else {
-        wcerr << L"Ошибка получения информации о томе." << endl;
+        }
     }
 
-    DWORD sectorsPerCluster, bytesPerSector, numberOfFreeClusters, totalNumberOfClusters;
-    if (GetDiskFreeSpace(drive.c_str(), &sectorsPerCluster, &bytesPerSector,
-                         &numberOfFreeClusters, &totalNumberOfClusters)) {
-        const ULONGLONG freeBytes = static_cast<ULONGLONG>(sectorsPerCluster) * bytesPerSector * numberOfFreeClusters;
-        wcout << L"Свободное место: " << freeBytes / (1024 * 1024) << L" МБ" << endl;
-    } else {
-        wcerr << L"Ошибка получения информации о свободном месте." << endl;
-    }
-}
-
-// Создание заданного каталога с использованием CreateDirectory
-void CreateDirectoryFunc() {
-    wstring dirPath;
-    wcout << L"Введите путь для создания каталога: ";
-    wcin.ignore();
-    getline(wcin, dirPath);
-    if (CreateDirectory(dirPath.c_str(), nullptr)) {
-        wcout << L"Каталог создан успешно." << endl;
-    } else {
-        wcerr << L"Ошибка создания каталога. Код ошибки: " << GetLastError() << endl;
-    }
-}
-
-// Удаление заданного каталога с использованием RemoveDirectory
-void RemoveDirectoryFunc() {
-    wstring dirPath;
-    wcout << L"Введите путь для удаления каталога: ";
-    wcin.ignore();
-    getline(wcin, dirPath);
-    if (RemoveDirectory(dirPath.c_str())) {
-        wcout << L"Каталог удален успешно." << endl;
-    } else {
-        wcerr << L"Ошибка удаления каталога. Код ошибки: " << GetLastError() << endl;
-    }
-}
-
-// Создание файла в новом каталоге с использованием CreateFile
-void CreateFileFunc() {
-    wstring filePath;
-    wcout << L"Введите полный путь для создания файла: ";
-    wcin.ignore();
-    getline(wcin, filePath);
-    HANDLE hFile = CreateFile(filePath.c_str(),
-                              GENERIC_WRITE,
-                              0,
-                              nullptr,
-                              CREATE_NEW,
-                              FILE_ATTRIBUTE_NORMAL,
-                              nullptr);
-    if (hFile == INVALID_HANDLE_VALUE) {
-        wcerr << L"Ошибка создания файла. Код ошибки: " << GetLastError() << endl;
-    } else {
-        wcout << L"Файл создан успешно." << endl;
-        CloseHandle(hFile);
-    }
-}
-
-// Копирование файла с проверкой на совпадение имён (CopyFile)
-void CopyFileFunc() {
-    wstring srcPath, destPath;
-    wcin.ignore();
-    wcout << L"Введите путь исходного файла: ";
-    getline(wcin, srcPath);
-    wcout << L"Введите путь для копирования файла: ";
-    getline(wcin, destPath);
-
-    // Проверка существования файла в целевом каталоге
-    if (GetFileAttributes(destPath.c_str()) != INVALID_FILE_ATTRIBUTES) {
-        wcout << L"Файл с таким именем уже существует в целевом каталоге." << endl;
-        return;
-    }
-    if (CopyFile(srcPath.c_str(), destPath.c_str(), TRUE)) {
-        wcout << L"Файл скопирован успешно." << endl;
-    } else {
-        wcerr << L"Ошибка копирования файла. Код ошибки: " << GetLastError() << endl;
-    }
-}
-
-// Перемещение файла с проверкой на совпадение имён (MoveFile)
-void MoveFileFunc() {
-    wstring srcPath, destPath;
-    wcin.ignore();
-    wcout << L"Введите путь исходного файла: ";
-    getline(wcin, srcPath);
-    wcout << L"Введите путь для перемещения файла: ";
-    getline(wcin, destPath);
-
-    // Проверка существования файла в целевом каталоге
-    if (GetFileAttributes(destPath.c_str()) != INVALID_FILE_ATTRIBUTES) {
-        wcout << L"Файл с таким именем уже существует в целевом каталоге." << endl;
-        return;
-    }
-    if (MoveFile(srcPath.c_str(), destPath.c_str())) {
-        wcout << L"Файл перемещен успешно." << endl;
-    } else {
-        wcerr << L"Ошибка перемещения файла. Код ошибки: " << GetLastError() << endl;
-    }
-}
-
-// Анализ и изменение атрибутов файла (например, установка/снятие скрытого атрибута)
-// Дополнительно выводится время создания файла с использованием GetFileTime
-void FileAttributesFunc() {
-    wstring filePath;
-    wcin.ignore();
-    wcout << L"Введите путь к файлу: ";
-    getline(wcin, filePath);
-
-    DWORD attributes = GetFileAttributes(filePath.c_str());
-    if (attributes == INVALID_FILE_ATTRIBUTES) {
-        wcerr << L"Ошибка получения атрибутов файла. Код ошибки: " << GetLastError() << endl;
-        return;
-    }
-    wcout << L"Текущие атрибуты файла: " << attributes << endl;
-    wcout << L"1. Сделать файл скрытым" << endl;
-    wcout << L"2. Убрать скрытый атрибут" << endl;
-    wcout << L"Выберите действие: ";
-    int choice;
-    wcin >> choice;
-    if (choice == 1) {
-        attributes |= FILE_ATTRIBUTE_HIDDEN;
-        if (SetFileAttributes(filePath.c_str(), attributes))
-            wcout << L"Атрибут изменен: файл скрыт." << endl;
-        else
-            wcerr << L"Ошибка установки атрибутов. Код ошибки: " << GetLastError() << endl;
-    } else if (choice == 2) {
-        attributes &= ~FILE_ATTRIBUTE_HIDDEN;
-        if (SetFileAttributes(filePath.c_str(), attributes))
-            wcout << L"Атрибут изменен: файл теперь не скрытый." << endl;
-        else
-            wcerr << L"Ошибка установки атрибутов. Код ошибки: " << GetLastError() << endl;
-    } else {
-        wcout << L"Неверный выбор." << endl;
-    }
-
-    // Получение времени создания файла
-    HANDLE hFile = CreateFile(filePath.c_str(), GENERIC_READ,
-                              FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
-    if (hFile == INVALID_HANDLE_VALUE) {
-        wcerr << L"Ошибка открытия файла для чтения времени. Код ошибки: " << GetLastError() << endl;
-        return;
-    }
-    FILETIME creationTime, lastAccessTime, lastWriteTime;
-    if (GetFileTime(hFile, &creationTime, &lastAccessTime, &lastWriteTime)) {
-        SYSTEMTIME stUTC, stLocal;
-        FileTimeToSystemTime(&creationTime, &stUTC);
-        SystemTimeToTzSpecificLocalTime(nullptr, &stUTC, &stLocal);
-        wcout << L"Время создания файла: "
-                << stLocal.wDay << L"/" << stLocal.wMonth << L"/" << stLocal.wYear
-                << L" " << stLocal.wHour << L":" << stLocal.wMinute << L":" << stLocal.wSecond
-                << endl;
-    } else {
-        wcerr << L"Ошибка получения времени файла. Код ошибки: " << GetLastError() << endl;
-    }
-    CloseHandle(hFile);
-}
-
-int main() {
-    SetConsoleToUTF8();
-    setlocale(LC_ALL, "ru_RU.UTF-8");
-
-    int choice;
+    // Ждём, пока все байты не будут записаны
     while (true) {
-        wcout << L"\nМеню:" << endl;
-        wcout << L"1. Вывести список дисков" << endl;
-        wcout << L"2. Вывести информацию о диске и свободное место" << endl;
-        wcout << L"3. Создать каталог" << endl;
-        wcout << L"4. Удалить каталог" << endl;
-        wcout << L"5. Создать файл" << endl;
-        wcout << L"6. Копировать файл" << endl;
-        wcout << L"7. Переместить файл" << endl;
-        wcout << L"8. Анализ и изменение атрибутов файла" << endl;
-        wcout << L"9. Выход" << endl;
-        wcout << L"Выберите пункт меню: ";
-        if (!(wcin >> choice)) {
-            wcin.clear(); // Сброс флага ошибки
-            wcin.ignore(numeric_limits<streamsize>::max(), L'\n'); // Очистка буфера ввода
-            ClearScreen();
-            wcout << L"Ошибка ввода. Попробуйте еще раз." << endl;
-            continue;
-        }
+        pthread_mutex_lock(&g_mutex);
+        bool done = g_copy_done;
+        pthread_mutex_unlock(&g_mutex);
 
-        switch (choice) {
-            case 1:
-                ListDrives();
-                break;
-            case 2:
-                ShowDriveInfo();
-                break;
-            case 3:
-                CreateDirectoryFunc();
-                break;
-            case 4:
-                RemoveDirectoryFunc();
-                break;
-            case 5:
-                CreateFileFunc();
-                break;
-            case 6:
-                CopyFileFunc();
-                break;
-            case 7:
-                MoveFileFunc();
-                break;
-            case 8:
-                FileAttributesFunc();
-                break;
-            case 9:
-                wcout << L"Выход из программы." << endl;
-                return 0;
-            default:
-                ClearScreen();
-                wcout << L"Неверный выбор, попробуйте снова." << endl;
-        }
-        if (choice > 0 && choice < 9) {
-            WaitForKeyPress();
-            ClearScreen();
-        }
+        if (done) break;
+        sleep(1);
     }
+
+    auto end_time = std::chrono::high_resolution_clock::now();
+    double duration_sec = std::chrono::duration<double>(end_time - start_time).count();
+
+    // Закрываем файлы
+    close(g_fd_in);
+    close(g_fd_out);
+
+    // Освобождаем массив слотов
+    delete[] g_slots;
+    g_slots = nullptr;
+
+    printf("Copied %" PRId64 " bytes in %.6f seconds\n", (int64_t) g_bytes_written, duration_sec);
+    if (duration_sec > 0.0) {
+        double mbps = (double) g_bytes_written / (1024.0 * 1024.0) / duration_sec;
+        printf("Speed: %.2f MB/s\n", mbps);
+    }
+
+    return 0;
 }
