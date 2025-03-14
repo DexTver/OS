@@ -1,60 +1,57 @@
 #define _GNU_SOURCE
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <aio.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <signal.h>
+#include <sys/stat.h>
+#include <sys/types.h>
+#include <pthread.h>
+#include <chrono>
+#include <string>
+#include <iostream>
+#include <iomanip>
 
-#include <cstdio>       // printf, perror
-#include <cstdlib>      // exit, EXIT_FAILURE
-#include <cstring>      // memset, strerror
-#include <aio.h>        // aio_read, aio_write, etc.
-#include <fcntl.h>      // open, O_RDONLY | O_NONBLOCK, etc.
-#include <unistd.h>     // close
-#include <signal.h>     // sigevent, SIGEV_THREAD
-#include <sys/stat.h>   // fstat
-#include <sys/types.h>  // off_t
-#include <pthread.h>    // pthread_mutex_t, pthread_mutex_lock, etc.
-#include <chrono>       // для замера времени
-#include <inttypes.h>   // PRId64
-
-// ---------------------------------------------------------------
-// Структура, описывающая одну асинхронную операцию чтения/записи
-// ---------------------------------------------------------------
 struct aio_operation {
-    struct aiocb aio;       // Управляющая структура для aio
-    char *buffer;           // Буфер для данных
-    size_t buffer_size;     // Размер буфера (байтов)
-    int write_operation;    // Флаг: 0=чтение, 1=запись
-    int slot_index;         // Индекс данного слота (для отладки)
+    struct aiocb aio;
+    char *buffer;
+    size_t buffer_size;
+    int write_operation;
+    int slot_index;
 };
 
-// ---------------------------------------------------------------
-// Глобальные переменные и мьютекс
-// ---------------------------------------------------------------
-static int g_fd_in = -1;            // Дескриптор исходного файла
-static int g_fd_out = -1;           // Дескриптор выходного файла
-static off_t g_file_size = 0;       // Общий размер исходного файла
-static off_t g_bytes_read = 0;      // Сколько байт запланировано к чтению
-static off_t g_bytes_written = 0;   // Сколько байт записано
-static size_t g_block_size = 0;     // Размер блока копирования
-static int g_concurrency = 1;       // Число слотов (одновременных операций)
-static bool g_copy_done = false;    // Признак завершения копирования
+static int g_fd_in = -1;
+static int g_fd_out = -1;
+static off_t g_file_size = 0;
+static off_t g_bytes_read = 0;
+static off_t g_bytes_written = 0;
+static size_t g_block_size = 0;
+static int g_concurrency = 1;
+static bool g_copy_done = false;
 
 static aio_operation *g_slots = nullptr;
 static pthread_mutex_t g_mutex = PTHREAD_MUTEX_INITIALIZER;
 
-// ---------------------------------------------------------------
-// ПРОТОТИПЫ вспомогательных функций
-// ---------------------------------------------------------------
+static std::string centerStr(const std::string &str, int width) {
+    if ((int) str.size() >= width) {
+        return str;
+    }
+    int left = (width - (int) str.size()) / 2;
+    int right = width - left - (int) str.size();
+    return std::string(left, ' ') + str + std::string(right, ' ');
+}
+
 static bool schedule_read(aio_operation &op);
 
 static bool schedule_write(aio_operation &op, ssize_t bytes_to_write, off_t offset);
 
-// ---------------------------------------------------------------
-// ГЛАВНАЯ функция-обработчик AIO, вызываемая по SIGEV_THREAD
-// ---------------------------------------------------------------
 static void aio_completion_handler(sigval_t sigval) {
     aio_operation *op = (aio_operation *) sigval.sival_ptr;
     if (!op) return;
 
     if (op->write_operation == 0) {
-        // Завершилась операция чтения
         ssize_t rbytes = aio_return(&op->aio);
         if (rbytes < 0) {
             perror("aio_return (read)");
@@ -63,29 +60,24 @@ static void aio_completion_handler(sigval_t sigval) {
             return;
         }
 
-        // Если rbytes == 0 -> EOF, освобождаем буфер
         if (rbytes == 0) {
             delete[] op->buffer;
             op->buffer = nullptr;
             return;
         }
 
-        // Успешно прочитано rbytes байт. Запланируем запись
         off_t write_offset = op->aio.aio_offset;
         if (!schedule_write(*op, rbytes, write_offset)) {
             perror("schedule_write");
-            // Запись не стартовала, освободим буфер
+
             delete[] op->buffer;
             op->buffer = nullptr;
         }
-
     } else {
-        // Завершилась операция записи
         ssize_t wbytes = aio_return(&op->aio);
         if (wbytes < 0) {
             perror("aio_return (write)");
         } else {
-            // Обновим счётчик записанных байт
             pthread_mutex_lock(&g_mutex);
             g_bytes_written += wbytes;
             if (g_bytes_written >= g_file_size) {
@@ -94,11 +86,11 @@ static void aio_completion_handler(sigval_t sigval) {
             pthread_mutex_unlock(&g_mutex);
         }
 
-        // Освободим буфер
+
         delete[] op->buffer;
         op->buffer = nullptr;
 
-        // Попробуем запланировать новое чтение, если копирование не завершено
+
         pthread_mutex_lock(&g_mutex);
         bool done = g_copy_done;
         pthread_mutex_unlock(&g_mutex);
@@ -109,9 +101,7 @@ static void aio_completion_handler(sigval_t sigval) {
     }
 }
 
-// ---------------------------------------------------------------
-// Планирование асинхронного чтения
-// ---------------------------------------------------------------
+
 static bool schedule_read(aio_operation &op) {
     pthread_mutex_lock(&g_mutex);
 
@@ -128,7 +118,7 @@ static bool schedule_read(aio_operation &op) {
 
     pthread_mutex_unlock(&g_mutex);
 
-    // Настройка структуры
+
     memset(&op.aio, 0, sizeof(op.aio));
     op.write_operation = 0;
     op.buffer_size = to_read;
@@ -139,13 +129,13 @@ static bool schedule_read(aio_operation &op) {
     op.aio.aio_nbytes = to_read;
     op.aio.aio_offset = offset;
 
-    // Указываем обработчик завершения
+
     op.aio.aio_sigevent.sigev_notify = SIGEV_THREAD;
     op.aio.aio_sigevent.sigev_notify_function = aio_completion_handler;
     op.aio.aio_sigevent.sigev_notify_attributes = nullptr;
     op.aio.aio_sigevent.sigev_value.sival_ptr = (void *) &op;
 
-    // Запускаем чтение
+
     if (aio_read(&op.aio) < 0) {
         perror("aio_read");
         delete[] op.buffer;
@@ -156,9 +146,6 @@ static bool schedule_read(aio_operation &op) {
     return true;
 }
 
-// ---------------------------------------------------------------
-// Планирование асинхронной записи
-// ---------------------------------------------------------------
 static bool schedule_write(aio_operation &op, ssize_t bytes_to_write, off_t offset) {
     op.write_operation = 1;
     memset(&op.aio, 0, sizeof(op.aio));
@@ -179,9 +166,6 @@ static bool schedule_write(aio_operation &op, ssize_t bytes_to_write, off_t offs
     return true;
 }
 
-// ---------------------------------------------------------------
-// main
-// ---------------------------------------------------------------
 int main(int argc, char *argv[]) {
     if (argc < 5) {
         printf("Usage: %s <source_file> <dest_file> <block_size> <concurrency>\n", argv[0]);
@@ -193,7 +177,6 @@ int main(int argc, char *argv[]) {
     g_block_size = (size_t) atoll(argv[3]);
     g_concurrency = atoi(argv[4]);
 
-    // Открываем файлы
     g_fd_in = open(source_path, O_RDONLY | O_NONBLOCK);
     if (g_fd_in < 0) {
         perror("open source");
@@ -207,7 +190,6 @@ int main(int argc, char *argv[]) {
         exit(EXIT_FAILURE);
     }
 
-    // Узнаём размер исходного файла
     struct stat st;
     if (fstat(g_fd_in, &st) < 0) {
         perror("fstat");
@@ -217,53 +199,69 @@ int main(int argc, char *argv[]) {
     }
     g_file_size = st.st_size;
 
-    printf("Copying from '%s' to '%s'\n", source_path, dest_path);
-    printf("File size = %" PRId64 " bytes\n", (int64_t) g_file_size);
-    printf("Block size = %zu, concurrency = %d\n", g_block_size, g_concurrency);
-
     auto start_time = std::chrono::high_resolution_clock::now();
 
-    // Создаём массив слотов
     g_slots = new aio_operation[g_concurrency];
     for (int i = 0; i < g_concurrency; i++) {
         memset(&g_slots[i], 0, sizeof(aio_operation));
         g_slots[i].slot_index = i;
     }
 
-    // Запускаем до g_concurrency операций чтения
     for (int i = 0; i < g_concurrency; i++) {
         if (!schedule_read(g_slots[i])) {
-            // Возможно, файл слишком мал - дальше не читаем
             break;
         }
     }
 
-    // Ждём, пока все байты не будут записаны
     while (true) {
         pthread_mutex_lock(&g_mutex);
         bool done = g_copy_done;
         pthread_mutex_unlock(&g_mutex);
-
         if (done) break;
-        sleep(1);
+        usleep(10000);
     }
 
     auto end_time = std::chrono::high_resolution_clock::now();
     double duration_sec = std::chrono::duration<double>(end_time - start_time).count();
 
-    // Закрываем файлы
     close(g_fd_in);
     close(g_fd_out);
 
-    // Освобождаем массив слотов
     delete[] g_slots;
     g_slots = nullptr;
 
-    printf("Copied %" PRId64 " bytes in %.6f seconds\n", (int64_t) g_bytes_written, duration_sec);
+    double speed_mbs = 0.0;
     if (duration_sec > 0.0) {
-        double mbps = (double) g_bytes_written / (1024.0 * 1024.0) / duration_sec;
-        printf("Speed: %.2f MB/s\n", mbps);
+        speed_mbs = (double) g_bytes_written / (1024.0 * 1024.0) / duration_sec;
     }
+
+    std::stringstream durationStream, speedStream;
+    durationStream << std::fixed << std::setprecision(2) << duration_sec;
+    speedStream << std::fixed << std::setprecision(2) << speed_mbs;
+    std::string duration_str = durationStream.str();
+    std::string speed_str = speedStream.str();
+
+    std::cout << std::string(103, '-') << "\n";
+    std::cout
+            << "|" << centerStr("File size (B)", 16)
+            << "|" << centerStr("Block size (B)", 16)
+            << "|" << centerStr("Threads", 16)
+            << "|" << centerStr("Copied (B)", 16)
+            << "|" << centerStr("Time (s)", 16)
+            << "|" << centerStr("Speed (MB/s)", 16)
+            << "|\n";
+    std::cout << std::string(103, '-') << "\n";
+
+    std::cout
+            << "|" << centerStr(std::to_string((long long) g_file_size), 16)
+            << "|" << centerStr(std::to_string((long long) g_block_size), 16)
+            << "|" << centerStr(std::to_string((long long) g_concurrency), 16)
+            << "|" << centerStr(std::to_string((long long) g_bytes_written), 16)
+            << "|" << centerStr(duration_str, 16)
+            << "|" << centerStr(speed_str, 16)
+            << "|\n";
+
+    std::cout << std::string(103, '-') << "\n";
 
     return 0;
 }
